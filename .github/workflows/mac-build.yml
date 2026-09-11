@@ -279,7 +279,14 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ inputs.tag }}"
-          NOTES="Scout $TAG for Mac (Apple Silicon and Intel). Open scout-macos.dmg, drag Scout to Applications, open Scout. Built from Orage-Agency/Scout-Desktop@${SOURCE_SHA:0:7}."
+          # Never replace a build people may already have: a release that
+          # already carries files is left alone. Use a new tag instead.
+          EXISTING="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length' 2>/dev/null || echo 0)"
+          if [ "${EXISTING:-0}" != "0" ]; then
+            echo "::error::Release $TAG already has $EXISTING file(s); refusing to overwrite. Pick a new tag."
+            exit 1
+          fi
+          NOTES="Scout $TAG for Mac (Apple Silicon and Intel). Open scout-macos.dmg, drag Scout to Applications, open Scout. Built from Orage-Agency/Scout-Desktop@${SOURCE_SHA:0:7} (${{ inputs.ref }})."
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
             || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
                  --title "Scout $TAG" --prerelease --latest=false --notes "$NOTES"
