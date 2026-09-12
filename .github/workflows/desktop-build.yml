@@ -88,13 +88,25 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ inputs.tag }}"
-          # Never replace a build people may already have: a release that
-          # already carries files is left alone. Use a new tag instead.
-          EXISTING="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length' 2>/dev/null || echo 0)"
-          if [ "${EXISTING:-0}" != "0" ]; then
-            echo "::error::Release $TAG already has $EXISTING file(s); refusing to overwrite. Pick a new tag."
-            exit 1
+          # Never replace a build people may already have. Only the files this
+          # run would upload are guarded, so a half-finished release can be
+          # completed later (e.g. "windows only" onto a mac-only release)
+          # without ever overwriting a file that is already there.
+          WANTED=""
+          if [ "${{ inputs.platforms }}" != "windows only" ]; then
+            WANTED="scout-macos.dmg scout-macos.zip"
           fi
+          if [ "${{ inputs.platforms }}" != "mac only" ]; then
+            WANTED="$WANTED scout-windows-x64.zip"
+          fi
+          EXISTING="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name] | join(" ")' 2>/dev/null || echo "")"
+          for f in $WANTED; do
+            case " $EXISTING " in
+              *" $f "*)
+                echo "::error::Release $TAG already carries $f; refusing to overwrite. Pick a new tag."
+                exit 1;;
+            esac
+          done
           SHA="${{ steps.resolve.outputs.sha }}"
           NOTES="$(cat <<EOF
           Scout ${TAG}.
@@ -388,6 +400,33 @@ jobs:
         # (sidebar/tab switch expressions); the tree shaker dropped some.
         run: flutter build windows --release --no-tree-shake-icons
 
+      # windows/CMakeLists.txt names the Flutter executable (BINARY_NAME) and
+      # upstream renames it from time to time (scout_flutter -> scout_desktop
+      # on 2026-09-12, which broke packaging). Read the name from the source
+      # instead of hardcoding it, and fall back to the one .exe the Flutter
+      # build leaves in the Release folder (the engine is copied in later).
+      - name: Find the built Flutter executable
+        id: winexe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $release = "build\windows\x64\runner\Release"
+          $name = $null
+          $m = Select-String -Path "windows\CMakeLists.txt" -Pattern 'set\(BINARY_NAME\s+"([^"]+)"' | Select-Object -First 1
+          if ($m) { $name = $m.Matches[0].Groups[1].Value }
+          if ($name -and (Test-Path "$release\$name.exe")) {
+            $exe = "$name.exe"
+          } else {
+            $found = @(Get-ChildItem -Path $release -Filter *.exe -File)
+            if ($found.Count -ne 1) {
+              throw "Cannot tell which .exe is the Scout shell: found $($found.Count) in $release ($($found.Name -join ', ')); BINARY_NAME said '$name'"
+            }
+            $exe = $found[0].Name
+            Write-Host "::warning::BINARY_NAME '$name' did not match a file; using $exe"
+          }
+          Write-Host "Flutter executable: $exe"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "exe=$exe"
+
       # ---- Scout Engine (Electron) ------------------------------------------
 
       - name: Set up Node
@@ -453,7 +492,7 @@ jobs:
           $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
             Sort-Object FullName -Descending | Select-Object -First 1
           $targets = @(
-            "build\windows\x64\runner\Release\scout_flutter.exe",
+            "build\windows\x64\runner\Release\${{ steps.winexe.outputs.exe }}",
             "engine\dist\win-unpacked\Scout Engine.exe"
           )
           foreach ($t in $targets) {
@@ -470,23 +509,24 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $release = "build\windows\x64\runner\Release"
-          if (-not (Test-Path "$release\scout_flutter.exe")) {
-            throw "scout_flutter.exe not found: check BINARY_NAME in windows/CMakeLists.txt"
+          $flutterExe = "${{ steps.winexe.outputs.exe }}"
+          if (-not (Test-Path "$release\$flutterExe")) {
+            throw "$flutterExe not found in $release"
           }
           if (Test-Path "$release\engine") { Remove-Item -Recurse -Force "$release\engine" }
           Copy-Item -Recurse -Force "engine\dist\win-unpacked" "$release\engine"
           if (-not (Test-Path "$release\engine\Scout Engine.exe")) { throw "engine missing from the bundle" }
 
           # One folder called Scout inside the zip, and the thing people
-          # double-click is Scout.exe: the Flutter binary is named
-          # scout_flutter.exe by windows/CMakeLists.txt, and nothing in the app
-          # reads its own file name (the window title is set to "Scout" at
-          # runtime by lib/platform/window_setup_io.dart).
+          # double-click is Scout.exe: the Flutter binary is named by
+          # BINARY_NAME in windows/CMakeLists.txt, and nothing in the app reads
+          # its own file name (the window title is set to "Scout" at runtime by
+          # lib/platform/window_setup_io.dart).
           $stage = "stage\Scout"
           if (Test-Path "stage") { Remove-Item -Recurse -Force "stage" }
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item -Recurse -Force "$release\*" $stage
-          Rename-Item "$stage\scout_flutter.exe" "Scout.exe"
+          Rename-Item "$stage\$flutterExe" "Scout.exe"
           if (-not (Test-Path "$stage\Scout.exe")) { throw "Scout.exe missing from the staged folder" }
           if (-not (Test-Path "$stage\data\flutter_assets")) { throw "flutter_assets missing from the staged folder" }
           Get-ChildItem $stage | Select-Object Mode, Length, Name
