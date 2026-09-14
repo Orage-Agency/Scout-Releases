@@ -434,10 +434,28 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
+      # Same reason as the Mac job: pubspec.yaml is not reliably bumped per
+      # release, so stamp the executable from the release tag instead of
+      # trusting whatever version the source happens to carry.
+      - name: Derive the app version from the tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          BUILD_NAME="${TAG#v}"
+          BUILD_NUMBER="${{ github.run_number }}"
+          echo "build_name=$BUILD_NAME" >> "$GITHUB_OUTPUT"
+          echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "App version: $BUILD_NAME ($BUILD_NUMBER)"
+
       - name: Build desktop app
         # --no-tree-shake-icons: the shell picks Material icons at runtime
         # (sidebar/tab switch expressions); the tree shaker dropped some.
-        run: flutter build windows --release --no-tree-shake-icons
+        run: >-
+          flutter build windows --release --no-tree-shake-icons
+          --build-name "${{ steps.version.outputs.build_name }}"
+          --build-number "${{ steps.version.outputs.build_number }}"
 
       # windows/CMakeLists.txt names the Flutter executable (BINARY_NAME) and
       # upstream renames it from time to time (scout_flutter -> scout_desktop
