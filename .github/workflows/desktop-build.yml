@@ -153,10 +153,28 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
+      # pubspec.yaml is not bumped per release, so the app would report the
+      # stale pubspec version (alpha.12 showed "4.0.0-alpha.6"). Stamp the
+      # bundle from the release tag instead: CFBundleShortVersionString = tag
+      # without the leading v, CFBundleVersion = this run's number.
+      - name: Derive the app version from the tag
+        id: version
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          BUILD_NAME="${TAG#v}"
+          BUILD_NUMBER="${{ github.run_number }}"
+          echo "build_name=$BUILD_NAME" >> "$GITHUB_OUTPUT"
+          echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "App version: $BUILD_NAME ($BUILD_NUMBER)"
+
       - name: Build desktop app
         # --no-tree-shake-icons: the shell picks Material icons at runtime
         # (sidebar/tab switch expressions); the tree shaker dropped some.
-        run: flutter build macos --release --no-tree-shake-icons
+        run: >-
+          flutter build macos --release --no-tree-shake-icons
+          --build-name "${{ steps.version.outputs.build_name }}"
+          --build-number "${{ steps.version.outputs.build_number }}"
 
       # ---- Scout Engine (Electron) ------------------------------------------
 
@@ -305,6 +323,26 @@ jobs:
             codesign --display --verbose=2 "$app" 2>&1 | grep -E "Authority|flags|TeamIdentifier" || true
           }
 
+          # lib/services/teach/whisper_service.dart looks for whisper-cli at
+          # Scout.app/Contents/Resources/whisper-bin/whisper-cli (the copy
+          # electron-builder puts inside the engine's Resources/whisper is not
+          # where the Dart side resolves it). Copy it in and sign it as nested
+          # code before the outer app is signed. Best effort: without it the
+          # app only loses local narration transcription.
+          add_whisper() {
+            local app="$1" src="engine/whisper-bin/whisper-cli"
+            if [ ! -f "$src" ]; then
+              echo "::warning::whisper-cli not found at $src; shipping Scout without local narration transcription"
+              return 0
+            fi
+            mkdir -p "$app/Contents/Resources/whisper-bin"
+            cp "$src" "$app/Contents/Resources/whisper-bin/whisper-cli"
+            chmod +x "$app/Contents/Resources/whisper-bin/whisper-cli"
+            codesign --force --options runtime --timestamp --keychain "$SIGN_KEYCHAIN" --sign "$SIGN_IDENTITY" \
+              "$app/Contents/Resources/whisper-bin/whisper-cli"
+            echo "whisper-cli bundled at Contents/Resources/whisper-bin/whisper-cli"
+          }
+
           make_dmg() {
             local app="$1" dmg="$2" vol="dmg-root-$(basename "$dmg" .dmg)"
             rm -rf "$vol" "$dmg"; mkdir -p "$vol"
@@ -333,6 +371,7 @@ jobs:
             ditto "$APP" "$app"
             mkdir -p "$app/Contents/Resources/engine"
             ditto "$engine" "$app/Contents/Resources/engine/Scout Engine.app"
+            add_whisper "$app"
             sign_app "$app"
             notarize "$app"
             spctl --assess --type execute --verbose=2 "$app"
