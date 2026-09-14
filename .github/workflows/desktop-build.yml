@@ -35,6 +35,11 @@ on:
           - 'mac and windows'
           - 'mac only'
           - 'windows only'
+      replace_existing:
+        description: 'Overwrite files already on this release (use to add a file to a finished release)'
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: desktop-build-${{ inputs.tag }}
@@ -97,23 +102,31 @@ jobs:
             WANTED="scout-macos.dmg scout-macos.zip"
           fi
           if [ "${{ inputs.platforms }}" != "mac only" ]; then
-            WANTED="$WANTED scout-windows-x64.zip"
+            WANTED="$WANTED scout-windows-setup.exe scout-windows-x64.zip"
           fi
-          EXISTING="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name] | join(" ")' 2>/dev/null || echo "")"
-          for f in $WANTED; do
-            case " $EXISTING " in
-              *" $f "*)
-                echo "::error::Release $TAG already carries $f; refusing to overwrite. Pick a new tag."
-                exit 1;;
-            esac
-          done
+          # replace_existing is the deliberate escape hatch: it is how a file
+          # gets added to (or refreshed on) a release that is already finished.
+          if [ "${{ inputs.replace_existing }}" = "true" ]; then
+            echo "replace_existing is on: existing files on $TAG may be overwritten."
+          else
+            EXISTING="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name] | join(" ")' 2>/dev/null || echo "")"
+            for f in $WANTED; do
+              case " $EXISTING " in
+                *" $f "*)
+                  echo "::error::Release $TAG already carries $f; refusing to overwrite. Pick a new tag, or re-run with replace_existing."
+                  exit 1;;
+              esac
+            done
+          fi
           SHA="${{ steps.resolve.outputs.sha }}"
           NOTES="$(cat <<EOF
           Scout ${TAG}.
 
           **Mac** (Apple Silicon and Intel) — download \`scout-macos.dmg\`, open it, drag Scout to Applications, open Scout. Signed by Orage and notarized by Apple, so it opens with a double-click.
 
-          **Windows 10/11 (64-bit)** — download \`scout-windows-x64.zip\`, unzip it, open the \`Scout\` folder and run \`Scout.exe\`. It is not code-signed yet, so the first run shows "Windows protected your PC": click **More info**, then **Run anyway**.
+          **Windows 10/11 (64-bit)** — download \`scout-windows-setup.exe\` and run it. It installs Scout for your user (no admin password needed) and adds Scout to the Start menu. It is not code-signed yet, so Windows shows "Windows protected your PC" once: click **More info**, then **Run anyway**.
+
+          Prefer no installer? \`scout-windows-x64.zip\` is the same app as a plain folder — unzip it and run \`Scout\Scout.exe\`.
 
           Built from Orage-Agency/Scout-Desktop@${SHA:0:7} (${{ inputs.ref }}).
           EOF
@@ -608,6 +621,102 @@ jobs:
           }
           Get-Item $zip | Select-Object Name, Length
 
+      # ---- Installer ---------------------------------------------------------
+      # The zip works but asks people to unzip it and hunt for the .exe. Inno
+      # Setup 6 ships on the runner, so build a normal Windows installer from
+      # the very same staged folder. Per-user (PrivilegesRequired=lowest) so it
+      # never needs an admin password, which also keeps UAC away from an
+      # installer we cannot code-sign yet.
+      - name: Build the Windows installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stage = "stage\Scout"
+          if (-not (Test-Path "$stage\Scout.exe")) { throw "staged Scout.exe missing; the packaging step did not run" }
+
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $found = Get-ChildItem "C:\Program Files (x86)\Inno Setup*\ISCC.exe" -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+            if (-not $found) { throw "Inno Setup (ISCC.exe) not found on this runner" }
+            $iscc = $found.FullName
+          }
+
+          # Inno wants a plain numeric AppVersion; the tag carries the label.
+          $full = "${{ steps.version.outputs.build_name }}"
+          $numeric = ($full -split "-")[0]
+
+          $icon = ""
+          if (Test-Path "windows\runner\resources\app_icon.ico") {
+            $icon = "SetupIconFile=windows\runner\resources\app_icon.ico"
+          }
+
+          $iss = @(
+            '[Setup]',
+            '; A fixed AppId means the next version upgrades this one in place',
+            '; instead of installing a second copy next to it.',
+            'AppId={{8E6F1C2A-7B94-4F3D-9A15-2C7E4D5B6A38}',
+            'AppName=Scout',
+            'AppVersion=__NUMERIC__',
+            'AppVerName=Scout __FULL__',
+            'VersionInfoVersion=__NUMERIC__',
+            'AppPublisher=Orage',
+            'AppPublisherURL=https://orage.agency',
+            'DefaultDirName={autopf}\Scout',
+            'DefaultGroupName=Scout',
+            'DisableProgramGroupPage=yes',
+            'PrivilegesRequired=lowest',
+            'ArchitecturesAllowed=x64compatible',
+            'ArchitecturesInstallIn64BitMode=x64compatible',
+            'OutputDir=.',
+            'OutputBaseFilename=scout-windows-setup',
+            'Compression=lzma2/normal',
+            'SolidCompression=yes',
+            'WizardStyle=modern',
+            'UninstallDisplayName=Scout',
+            'UninstallDisplayIcon={app}\Scout.exe',
+            '__ICON__',
+            '',
+            '[Tasks]',
+            'Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"',
+            '',
+            '[Files]',
+            'Source: "stage\Scout\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion',
+            '',
+            '[Icons]',
+            'Name: "{group}\Scout"; Filename: "{app}\Scout.exe"',
+            'Name: "{autodesktop}\Scout"; Filename: "{app}\Scout.exe"; Tasks: desktopicon',
+            '',
+            '[Run]',
+            'Filename: "{app}\Scout.exe"; Description: "Open Scout"; Flags: nowait postinstall skipifsilent'
+          ) -join "`r`n"
+          $iss = $iss.Replace("__NUMERIC__", $numeric).Replace("__FULL__", $full).Replace("__ICON__", $icon)
+          Set-Content -Path "scout.iss" -Value $iss -Encoding UTF8
+          Write-Host "--- scout.iss ---"
+          Get-Content "scout.iss" | Select-Object -First 25
+
+          & $iscc "scout.iss" | Select-Object -Last 8
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path "scout-windows-setup.exe")) { throw "the installer was not produced" }
+          Get-Item "scout-windows-setup.exe" | Select-Object Name, Length
+
+      - name: Sign the installer
+        if: steps.wincert.outputs.have == 'yes'
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $cert = Join-Path $env:RUNNER_TEMP "scout-cert-installer.pfx"
+          [IO.File]::WriteAllBytes($cert, [Convert]::FromBase64String($env:WINDOWS_CERT_PFX_BASE64))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          & $signtool.FullName sign /fd SHA256 /f $cert /p $env:WINDOWS_CERT_PASSWORD `
+            /tr http://timestamp.digicert.com /td SHA256 "scout-windows-setup.exe"
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed on the installer" }
+          Remove-Item $cert -Force
+
       - name: Publish the Windows app to this download page
         shell: bash
         env:
@@ -615,9 +724,11 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ inputs.tag }}"
-          ls -la scout-windows-x64.zip
-          gh release upload "$TAG" scout-windows-x64.zip --repo "$GITHUB_REPOSITORY" --clobber
-          echo "Download: https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/scout-windows-x64.zip"
+          ls -la scout-windows-setup.exe scout-windows-x64.zip
+          gh release upload "$TAG" scout-windows-setup.exe scout-windows-x64.zip --repo "$GITHUB_REPOSITORY" --clobber
+          BASE="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          echo "Installer: $BASE/scout-windows-setup.exe"
+          echo "Zip:       $BASE/scout-windows-x64.zip"
 
   # What actually landed on the page, in one place.
   summary:
@@ -651,4 +762,5 @@ jobs:
           FAILED=0
           case "$MAC_WANTED:$ASSETS" in true:*scout-macos.dmg*) ;; true:*) echo "::error::scout-macos.dmg is missing"; FAILED=1;; esac
           case "$WIN_WANTED:$ASSETS" in true:*scout-windows-x64.zip*) ;; true:*) echo "::error::scout-windows-x64.zip is missing"; FAILED=1;; esac
+          case "$WIN_WANTED:$ASSETS" in true:*scout-windows-setup.exe*) ;; true:*) echo "::error::scout-windows-setup.exe is missing"; FAILED=1;; esac
           exit $FAILED
