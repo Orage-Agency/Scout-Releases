@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "tag": "v5.1.0",
+  "sourceCommit": "",
+  "platforms": {
+    "macos": {
+      "version": "5.1.0",
+      "tag": "v5.1.0",
+      "releasedAt": "2026-09-15T22:24:50.761Z",
+      "notes": "Scout v5.1.0.\n\n**Mac** (Apple Silicon and Intel) — download `scout-macos.dmg`, open it, drag Scout to Applications, open Scout. Signed by Orage and notarized by Apple, so it opens with a double-click.\n\n**Windows 10/11 (64-bit)** — download `scout-windows-setup.exe` and run it. It installs Scout for your user (no admin password needed) and adds Scout to the Start menu. It is not code-signed yet, so Windows shows \"Windows protected your PC\" once: click **More info**, then **Run anyway**.\n\nPrefer no installer? `scout-windows-x64.zip` is the same app as a plain folder — unzip it and run `Scout\\Scout.exe`.\n\nBuilt from Orage-Agency/Scout-Desktop@6b54b33 (6b54b335115f7e72336afe8aa76f50d74f4730c1).",
+      "pageUrl": "https://github.com/Orage-Agency/Scout-Releases/releases/tag/v5.1.0",
+      "universal": true,
+      "url": "https://github.com/Orage-Agency/Scout-Releases/releases/download/v5.1.0/scout-macos.zip",
+      "sha256": "282df6967c1ee917113ff6dd52d7a5560b12d43f87f439583e8c82d23baab1cf",
+      "size": 263560869
+    },
+    "windows": {
+      "version": "5.1.0",
+      "tag": "v5.1.0",
+      "releasedAt": "2026-09-15T22:24:50.761Z",
+      "notes": "Scout v5.1.0.\n\n**Mac** (Apple Silicon and Intel) — download `scout-macos.dmg`, open it, drag Scout to Applications, open Scout. Signed by Orage and notarized by Apple, so it opens with a double-click.\n\n**Windows 10/11 (64-bit)** — download `scout-windows-setup.exe` and run it. It installs Scout for your user (no admin password needed) and adds Scout to the Start menu. It is not code-signed yet, so Windows shows \"Windows protected your PC\" once: click **More info**, then **Run anyway**.\n\nPrefer no installer? `scout-windows-x64.zip` is the same app as a plain folder — unzip it and run `Scout\\Scout.exe`.\n\nBuilt from Orage-Agency/Scout-Desktop@6b54b33 (6b54b335115f7e72336afe8aa76f50d74f4730c1).",
+      "pageUrl": "https://github.com/Orage-Agency/Scout-Releases/releases/tag/v5.1.0",
+      "url": "https://github.com/Orage-Agency/Scout-Releases/releases/download/v5.1.0/scout-windows-setup.exe",
+      "sha256": "eababe33625644a7ee623c224af3757100eaac2417574ee5814843941d9c06fe",
+      "size": 135899892
+    }
+  }
+}
