@@ -886,21 +886,26 @@ jobs:
       - name: Commit it
         run: |
           set -euo pipefail
-          # Refuse to commit anything that is not an updates/*.json file. This
-          # is what stops a bug here ever writing a latest*.yml — the file the
-          # Scout 1 fleet's updater reads.
-          BAD="$(git status --porcelain | awk '{print $2}' | grep -v '^updates/.*\.json$' || true)"
+          # Stage only updates/, then check what is actually staged. Refusing
+          # anything that is not an updates/*.json file is what stops a bug
+          # here ever writing a latest*.yml — the file the Scout 1 fleet's
+          # updater reads.
+          #
+          # Check the INDEX, not `git status --porcelain`: porcelain collapses
+          # a new untracked directory to "updates/builds/" rather than listing
+          # the files in it, which failed this guard on the very first real run.
+          git add -A updates
+          BAD="$(git diff --cached --name-only | grep -v '^updates/.*\.json$' || true)"
           if [ -n "$BAD" ]; then
             echo "::error::Refusing to commit paths outside updates/**.json: $BAD"
             exit 1
           fi
-          if git diff --quiet && git diff --cached --quiet; then
+          if git diff --cached --quiet; then
             echo "Manifest unchanged; nothing to commit."
             exit 0
           fi
           git config user.name "scout-release-bot"
           git config user.email "noreply@github.com"
-          git add updates
           git commit -m "updates: record ${{ inputs.tag }} and refresh beta"
           # The concurrency group is per-tag, so two builds can run at once.
           # Rebase and retry rather than losing a run to a push race.

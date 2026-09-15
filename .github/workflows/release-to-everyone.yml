@@ -92,18 +92,21 @@ jobs:
       - name: Commit it
         run: |
           set -euo pipefail
-          BAD="$(git status --porcelain | awk '{print $2}' | grep -v '^updates/.*\.json$' || true)"
+          # Check the INDEX, not `git status --porcelain`: porcelain collapses
+          # a new untracked directory to "updates/builds/" rather than listing
+          # the files in it, which failed this guard on the very first run.
+          git add -A updates
+          BAD="$(git diff --cached --name-only | grep -v '^updates/.*\.json$' || true)"
           if [ -n "$BAD" ]; then
             echo "::error::Refusing to commit paths outside updates/**.json: $BAD"
             exit 1
           fi
-          if git diff --quiet; then
+          if git diff --cached --quiet; then
             echo "Everyone is already on ${{ inputs.tag }}; nothing to change."
             exit 0
           fi
           git config user.name "scout-release-bot"
           git config user.email "noreply@github.com"
-          git add updates
           git commit -m "updates: stable -> ${{ inputs.tag }} (rollout ${{ inputs.rollout }}%)"
           for i in 1 2 3; do
             git push && exit 0
