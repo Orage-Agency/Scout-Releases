@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "channel": "beta",
+  "manifestUrl": "https://raw.githubusercontent.com/Orage-Agency/Scout-Releases/main/updates/beta.json",
+  "rollout": 0,
+  "platforms": {}
+}

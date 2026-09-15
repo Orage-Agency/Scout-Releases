@@ -1,0 +1,142 @@
+name: Release to everyone
+
+# Gives one already-built version to everyone using Scout. Their app offers it
+# the next time they open it.
+#
+# THIS IS ALSO THE UNDO BUTTON. If a version turns out to be bad, run this
+# again with the previous tag and people stop being offered the bad one within
+# about five minutes. (It cannot take it off a computer that already updated —
+# for that, build the fix and release that.)
+#
+# To stop everything without picking a version, run it with Percent = 0.
+#
+# It only ever writes files under updates/. It never creates or edits a
+# release, so it cannot move this repository's "latest" release off v3.6.0 —
+# which is what the old Scout 1 fleet still updates from.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Which version to give everyone, e.g. v5.2.0. To undo a bad release, put the previous good one here.'
+        required: true
+      rollout:
+        description: 'Percent of people offered it. 100 = everyone. 0 = nobody (emergency stop).'
+        required: true
+        default: '100'
+
+# Two people pressing this at once would race on the same file.
+concurrency:
+  group: update-channel-stable
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    name: Put ${{ inputs.tag }} in front of everyone
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Check that version was actually built
+        run: |
+          set -euo pipefail
+          FILE="updates/builds/${{ inputs.tag }}.json"
+          if [ ! -f "$FILE" ]; then
+            echo "::error::There is no record of ${{ inputs.tag }}. Build it first (Desktop build), or run the backfill workflow on it."
+            exit 1
+          fi
+          if ! jq -e '.platforms.macos and .platforms.windows' "$FILE" >/dev/null; then
+            echo "::error::${{ inputs.tag }} is missing a platform, so it is not safe to give everyone. Re-run the build for the missing one."
+            exit 1
+          fi
+
+      # Cheap and worth it: a deleted or renamed asset would 404 for the whole
+      # fleet, and nothing else would notice until people complained.
+      - name: Check every download still works
+        run: |
+          set -euo pipefail
+          jq -r '.platforms[].url' "updates/builds/${{ inputs.tag }}.json" | while read -r u; do
+            code="$(curl -sS -o /dev/null -w '%{http_code}' -I -L --max-time 30 "$u")"
+            echo "$code  $u"
+            if [ "$code" != "200" ]; then
+              echo "::error::$u answered $code — that download is gone, so this version cannot be released."
+              exit 1
+            fi
+          done
+
+      - name: Fetch the release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release view "${{ inputs.tag }}" --repo "$GITHUB_REPOSITORY" \
+            --json body --jq .body > /tmp/notes.md
+
+      - name: Write the stable channel
+        env:
+          NOTES_FILE: /tmp/notes.md
+          REPO: ${{ github.repository }}
+        run: |
+          node .github/scripts/update-manifest.mjs promote \
+            --tag "${{ inputs.tag }}" \
+            --channel stable \
+            --rollout "${{ inputs.rollout }}"
+
+      - name: Commit it
+        run: |
+          set -euo pipefail
+          BAD="$(git status --porcelain | awk '{print $2}' | grep -v '^updates/.*\.json$' || true)"
+          if [ -n "$BAD" ]; then
+            echo "::error::Refusing to commit paths outside updates/**.json: $BAD"
+            exit 1
+          fi
+          if git diff --quiet; then
+            echo "Everyone is already on ${{ inputs.tag }}; nothing to change."
+            exit 0
+          fi
+          git config user.name "scout-release-bot"
+          git config user.email "noreply@github.com"
+          git add updates
+          git commit -m "updates: stable -> ${{ inputs.tag }} (rollout ${{ inputs.rollout }}%)"
+          for i in 1 2 3; do
+            git push && exit 0
+            echo "push attempt $i lost a race; rebasing"
+            git pull --rebase origin main
+          done
+          echo "::error::Could not push after 3 attempts"
+          exit 1
+
+      - name: Confirm the Scout 1 fleet is still pointed at v3.6.0
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          LATEST="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
+          if [ "$LATEST" != "v3.6.0" ]; then
+            echo "::error::releases/latest is $LATEST, not v3.6.0 — the Scout 1 fleet reads latest*.yml from there."
+            exit 1
+          fi
+          {
+            if [ "${{ inputs.rollout }}" = "0" ]; then
+              echo "### Updates are PAUSED"
+              echo ""
+              echo "Nobody will be offered an update until you run this again with a percent above 0."
+            else
+              echo "### Everyone is now offered ${{ inputs.tag }}"
+              echo ""
+              echo "People see it the next time they open Scout, within about five minutes of now."
+              echo ""
+              echo "To undo this, run this workflow again with the previous version's tag."
+            fi
+            echo ""
+            echo '```json'
+            cat updates/stable.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

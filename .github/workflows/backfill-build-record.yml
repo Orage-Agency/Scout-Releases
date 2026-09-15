@@ -1,0 +1,85 @@
+name: Backfill a build record
+
+# One-off helper for a version that was built BEFORE the updater existed.
+#
+# "Release to everyone" needs a record of what a version's files are and what
+# they should hash to. Builds write that record themselves now, but older tags
+# (v5.1.0 and anything before it) have none, so they cannot be released to
+# anyone until this fills one in.
+#
+# It downloads that tag's Mac zip and Windows installer on a free runner,
+# hashes them, and writes updates/builds/<tag>.json. It changes nothing about
+# the release itself and does not put the version in front of anybody — run
+# "Release to everyone" afterwards for that.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Which already-published version to make releasable, e.g. v5.1.0'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  backfill:
+    name: Record what ${{ inputs.tag }} contains
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Fetch the release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release view "${{ inputs.tag }}" --repo "$GITHUB_REPOSITORY" \
+            --json body --jq .body > /tmp/notes.md
+
+      # ~400 MB over the runner's network; a couple of minutes, and free.
+      - name: Download the files and hash them
+        env:
+          REPO: ${{ github.repository }}
+          NOTES_FILE: /tmp/notes.md
+        run: node .github/scripts/update-manifest.mjs backfill --tag "${{ inputs.tag }}"
+
+      - name: Commit it
+        run: |
+          set -euo pipefail
+          BAD="$(git status --porcelain | awk '{print $2}' | grep -v '^updates/.*\.json$' || true)"
+          if [ -n "$BAD" ]; then
+            echo "::error::Refusing to commit paths outside updates/**.json: $BAD"
+            exit 1
+          fi
+          if git diff --quiet; then
+            echo "Already recorded; nothing to do."
+            exit 0
+          fi
+          git config user.name "scout-release-bot"
+          git config user.email "noreply@github.com"
+          git add updates
+          git commit -m "updates: record ${{ inputs.tag }} from its published files"
+          for i in 1 2 3; do
+            git push && exit 0
+            git pull --rebase origin main
+          done
+          echo "::error::Could not push after 3 attempts"
+          exit 1
+
+      - name: Say what to do next
+        run: |
+          {
+            echo "### ${{ inputs.tag }} can now be released"
+            echo ""
+            echo "Nobody has been offered it yet. Run **Release to everyone** with"
+            echo "\`${{ inputs.tag }}\` when you want people to get it."
+            echo ""
+            echo '```json'
+            cat "updates/builds/${{ inputs.tag }}.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

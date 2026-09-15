@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "channel": "stable",
+  "manifestUrl": "https://raw.githubusercontent.com/Orage-Agency/Scout-Releases/main/updates/stable.json",
+  "rollout": 0,
+  "platforms": {}
+}

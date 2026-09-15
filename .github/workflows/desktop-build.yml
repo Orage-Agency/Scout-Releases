@@ -158,6 +158,13 @@ jobs:
     # macOS waits on Apple's notarization service (up to three submissions).
     timeout-minutes: 180
 
+    # Handed to the manifest job so it never has to download a 284 MB file
+    # just to learn its checksum.
+    outputs:
+      universal: ${{ steps.hash.outputs.universal }}
+      zip_sha256: ${{ steps.hash.outputs.zip_sha256 }}
+      zip_size: ${{ steps.hash.outputs.zip_size }}
+
     steps:
       - name: Check out Scout-Desktop
         uses: actions/checkout@v4
@@ -431,12 +438,40 @@ jobs:
           gh release upload "$TAG" scout-macos* --repo "$GITHUB_REPOSITORY" --clobber
           echo "Download: https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/scout-macos.dmg"
 
+      # Hashed here, where the file already is, and AFTER the upload — so a
+      # checksum only ever exists for a file that actually reached the
+      # release. The app refuses a download whose bytes do not match.
+      - name: Record the Mac checksum
+        id: hash
+        run: |
+          set -euo pipefail
+          if [ -f scout-macos.zip ]; then
+            echo "zip_sha256=$(shasum -a 256 scout-macos.zip | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+            echo "zip_size=$(stat -f%z scout-macos.zip)" >> "$GITHUB_OUTPUT"
+            shasum -a 256 scout-macos.zip
+          fi
+          # When the universal engine merge fails, the packaging step falls
+          # back to separate arm64 and x64 builds — and scout-macos.zip is
+          # then ARM ONLY while keeping its universal name. Auto-updating an
+          # Intel Mac from that produces an app that cannot launch, so the
+          # manifest job refuses to publish this build for macOS.
+          if [ -f scout-macos-x64.zip ]; then
+            echo "universal=no" >> "$GITHUB_OUTPUT"
+            echo "::warning::This Mac build is split arm64/x64, not universal. It will NOT be offered as an automatic update; re-run the build to get a universal one."
+          else
+            echo "universal=yes" >> "$GITHUB_OUTPUT"
+          fi
+
   build-windows:
     name: Build Windows
     needs: prepare
     if: inputs.platforms != 'mac only'
     runs-on: windows-latest
     timeout-minutes: 120
+
+    outputs:
+      setup_sha256: ${{ steps.hash.outputs.setup_sha256 }}
+      setup_size: ${{ steps.hash.outputs.setup_size }}
 
     steps:
       - name: Check out Scout-Desktop
@@ -745,6 +780,22 @@ jobs:
           echo "Installer: $BASE/scout-windows-setup.exe"
           echo "Zip:       $BASE/scout-windows-x64.zip"
 
+      # The installer is what the app downloads and runs to update itself, so
+      # its checksum is what ends up in the manifest. Hashed after the upload
+      # for the same reason as the Mac job.
+      - name: Record the Windows checksum
+        id: hash
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $file = "scout-windows-setup.exe"
+          if (-not (Test-Path $file)) { throw "$file is missing; nothing to hash" }
+          $h = (Get-FileHash -Algorithm SHA256 $file).Hash.ToLower()
+          $s = (Get-Item $file).Length
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "setup_sha256=$h"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "setup_size=$s"
+          Write-Host "${file}: $h ($s bytes)"
+
   # What actually landed on the page, in one place.
   summary:
     name: What landed on the page
@@ -779,3 +830,106 @@ jobs:
           case "$WIN_WANTED:$ASSETS" in true:*scout-windows-x64.zip*) ;; true:*) echo "::error::scout-windows-x64.zip is missing"; FAILED=1;; esac
           case "$WIN_WANTED:$ASSETS" in true:*scout-windows-setup.exe*) ;; true:*) echo "::error::scout-windows-setup.exe is missing"; FAILED=1;; esac
           exit $FAILED
+
+  # Records what this build produced and puts it on the BETA channel, which
+  # is what George and Jose's copies of Scout read. Clients read `stable`,
+  # and nothing reaches that except the "Release to everyone" workflow.
+  #
+  # This job never creates or edits a release: the manifest is a file in this
+  # repository's git tree. That is the whole reason publishing an update
+  # cannot move `releases/latest` off v3.6.0 and break the Scout 1 fleet.
+  manifest:
+    name: Record the build and update the beta channel
+    needs: [prepare, build-macos, build-windows, summary]
+    # `summary` already fails the run when a platform this run asked for is
+    # missing its files, so reusing its verdict IS the half-manifest guard: a
+    # failed platform turns summary red and this job is skipped, so nothing is
+    # published. `always()` is needed because a skipped build job would
+    # otherwise skip this one too.
+    if: always() && needs.summary.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      # Read from the release rather than baked in at build time, so notes
+      # edited on the release page are the ones people see.
+      - name: Fetch the release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release view "${{ inputs.tag }}" --repo "$GITHUB_REPOSITORY" \
+            --json body --jq .body > /tmp/notes.md
+          wc -c /tmp/notes.md
+
+      - name: Write the build record and the beta channel
+        env:
+          TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
+          NOTES_FILE: /tmp/notes.md
+          MAC_RESULT: ${{ needs.build-macos.result }}
+          WIN_RESULT: ${{ needs.build-windows.result }}
+          MAC_UNIVERSAL: ${{ needs.build-macos.outputs.universal }}
+          MAC_ZIP_SHA256: ${{ needs.build-macos.outputs.zip_sha256 }}
+          MAC_ZIP_SIZE: ${{ needs.build-macos.outputs.zip_size }}
+          WIN_SETUP_SHA256: ${{ needs.build-windows.outputs.setup_sha256 }}
+          WIN_SETUP_SIZE: ${{ needs.build-windows.outputs.setup_size }}
+        run: node .github/scripts/update-manifest.mjs record
+
+      - name: Commit it
+        run: |
+          set -euo pipefail
+          # Refuse to commit anything that is not an updates/*.json file. This
+          # is what stops a bug here ever writing a latest*.yml — the file the
+          # Scout 1 fleet's updater reads.
+          BAD="$(git status --porcelain | awk '{print $2}' | grep -v '^updates/.*\.json$' || true)"
+          if [ -n "$BAD" ]; then
+            echo "::error::Refusing to commit paths outside updates/**.json: $BAD"
+            exit 1
+          fi
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "Manifest unchanged; nothing to commit."
+            exit 0
+          fi
+          git config user.name "scout-release-bot"
+          git config user.email "noreply@github.com"
+          git add updates
+          git commit -m "updates: record ${{ inputs.tag }} and refresh beta"
+          # The concurrency group is per-tag, so two builds can run at once.
+          # Rebase and retry rather than losing a run to a push race.
+          for i in 1 2 3; do
+            git push && exit 0
+            echo "push attempt $i lost a race; rebasing"
+            git pull --rebase origin main
+          done
+          echo "::error::Could not push the manifest after 3 attempts"
+          exit 1
+
+      - name: Confirm the Scout 1 fleet is still pointed at v3.6.0
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          LATEST="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
+          if [ "$LATEST" != "v3.6.0" ]; then
+            echo "::error::releases/latest is $LATEST, not v3.6.0 — the Scout 1 fleet reads latest*.yml from there."
+            exit 1
+          fi
+          echo "releases/latest is still v3.6.0 — V1 fleet untouched."
+          {
+            echo "### Beta channel"
+            echo ""
+            echo "George and Jose's Scout will offer this next time they open it."
+            echo "Clients see nothing until you run **Release to everyone**."
+            echo ""
+            echo '```json'
+            cat updates/beta.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
