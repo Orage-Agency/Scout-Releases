@@ -66,14 +66,21 @@ jobs:
       sha: ${{ steps.resolve.outputs.sha }}
 
     steps:
-      - name: Refuse a stable tag
-        # The V1 fleet reads latest*.yml from this repository's "latest"
-        # release and this build ships none: only hyphenated (prerelease) tags
-        # may land here.
+      - name: Check the tag
+        # A production tag (v5.1.0) is allowed as well as a prerelease one
+        # (v4.0.0-alpha.11): the tag is the version the app reports, and a
+        # shipping build should not have to call itself an alpha.
+        #
+        # What is NOT negotiable is that the release stays a prerelease and
+        # never becomes this repository's "latest" (see the create step). The
+        # V1 Scout 3 fleet auto-updates by reading latest*.yml from the latest
+        # non-prerelease release here — v3.6.0 — and these builds ship no such
+        # file. A release that took "latest" would point every V1 client at an
+        # update it cannot read.
         run: |
           case "${{ inputs.tag }}" in
-            v*-*) ;;
-            *) echo "::error::Tag must look like v4.0.0-alpha.11 (hyphenated prerelease)"; exit 1;;
+            v[0-9]*) ;;
+            *) echo "::error::Tag must look like v5.1.0 or v4.0.0-alpha.11"; exit 1;;
           esac
 
       - name: Resolve the source commit
@@ -131,9 +138,17 @@ jobs:
           Built from Orage-Agency/Scout-Desktop@${SHA:0:7} (${{ inputs.ref }}).
           EOF
           )"
+          # --prerelease --latest=false, always: see "Check the tag" above.
+          # The V1 fleet's updater must keep resolving to v3.6.0.
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
             || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
                  --title "Scout $TAG" --prerelease --latest=false --notes "$NOTES"
+          LATEST="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
+          if [ "$LATEST" = "$TAG" ]; then
+            echo "::error::$TAG became this repository's latest release; the V1 fleet updates from there."
+            exit 1
+          fi
+          echo "Latest release is still $LATEST — V1 fleet untouched."
 
   build-macos:
     name: Build macOS
