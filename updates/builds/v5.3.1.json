@@ -1,8 +1,6 @@
 {
   "schema": 1,
-  "channel": "beta",
-  "manifestUrl": "https://raw.githubusercontent.com/Orage-Agency/Scout-Releases/main/updates/beta.json",
-  "rollout": 100,
+  "tag": "v5.3.1",
   "platforms": {
     "macos": {
       "version": "5.3.1",
@@ -28,5 +26,5 @@
       "size": 135957164
     }
   },
-  "generatedAt": "2026-09-17T21:38:35.867Z"
+  "sourceCommit": "d95f2cd8ba069eb8eb2ac5e73d189287bea1705b"
 }
