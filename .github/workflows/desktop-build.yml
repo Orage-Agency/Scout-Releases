@@ -35,6 +35,8 @@ on:
           - 'mac and windows'
           - 'mac only'
           - 'windows only'
+          - 'mac, windows and linux'
+          - 'linux only'
       replace_existing:
         description: 'Overwrite files already on this release (use to add a file to a finished release)'
         type: boolean
@@ -105,12 +107,16 @@ jobs:
           # completed later (e.g. "windows only" onto a mac-only release)
           # without ever overwriting a file that is already there.
           WANTED=""
-          if [ "${{ inputs.platforms }}" != "windows only" ]; then
+          if [ "${{ inputs.platforms }}" != "windows only" ] && [ "${{ inputs.platforms }}" != "linux only" ]; then
             WANTED="scout-macos.dmg scout-macos.zip"
           fi
-          if [ "${{ inputs.platforms }}" != "mac only" ]; then
+          if [ "${{ inputs.platforms }}" != "mac only" ] && [ "${{ inputs.platforms }}" != "linux only" ]; then
             WANTED="$WANTED scout-windows-setup.exe scout-windows-x64.zip"
           fi
+          case "${{ inputs.platforms }}" in
+            'linux only'|'mac, windows and linux')
+              WANTED="$WANTED scout-linux-x64.tar.gz";;
+          esac
           # replace_existing is the deliberate escape hatch: it is how a file
           # gets added to (or refreshed on) a release that is already finished.
           if [ "${{ inputs.replace_existing }}" = "true" ]; then
@@ -138,6 +144,16 @@ jobs:
           Built from Orage-Agency/Scout-Desktop@${SHA:0:7} (${{ inputs.ref }}).
           EOF
           )"
+          case "${{ inputs.platforms }}" in
+            'linux only'|'mac, windows and linux')
+              LINUX_NOTE="$(cat <<'LNOTE'
+
+          **Linux (64-bit)** — download `scout-linux-x64.tar.gz`, untar it (`tar xzf scout-linux-x64.tar.gz`) and run `scout-linux-x64/scout_desktop`. Scout is not offered as an automatic update on Linux; install it once by hand and re-download new versions from this page. For a per-user install with a launcher entry, use `scripts/install-linux.sh` from a local checkout instead.
+          LNOTE
+          )"
+              NOTES="$NOTES$LINUX_NOTE"
+              ;;
+          esac
           # --prerelease --latest=false, always: see "Check the tag" above.
           # The V1 fleet's updater must keep resolving to v3.6.0.
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
@@ -153,7 +169,7 @@ jobs:
   build-macos:
     name: Build macOS
     needs: prepare
-    if: inputs.platforms != 'windows only'
+    if: inputs.platforms != 'windows only' && inputs.platforms != 'linux only'
     runs-on: macos-latest
     # macOS waits on Apple's notarization service (up to three submissions).
     timeout-minutes: 180
@@ -465,7 +481,7 @@ jobs:
   build-windows:
     name: Build Windows
     needs: prepare
-    if: inputs.platforms != 'mac only'
+    if: inputs.platforms != 'mac only' && inputs.platforms != 'linux only'
     runs-on: windows-latest
     timeout-minutes: 120
 
@@ -795,6 +811,143 @@ jobs:
           Add-Content -Path $env:GITHUB_OUTPUT -Value "setup_sha256=$h"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "setup_size=$s"
           Write-Host "${file}: $h ($s bytes)"
+
+  # Linux is the manual-install platform: the Scout 5 client never checks for
+  # updates there (it returns no platform key), so this build only needs to
+  # exist on the download page for people who install by hand. The Scout
+  # Engine (Electron) is expected at <bundle>/engine/scout-engine by
+  # lib/services/engine/engine_supervisor_io.dart, so the unpacked
+  # linux-unpacked engine is copied into the Flutter bundle and a stable
+  # `scout-engine` symlink is added. Linux is unsigned the same way Windows
+  # was before a certificate: fine for a hand-run tarball.
+  build-linux:
+    name: Build Linux
+    needs: prepare
+    if: inputs.platforms == 'linux only' || inputs.platforms == 'mac, windows and linux'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    outputs:
+      tar_sha256: ${{ steps.hash.outputs.tar_sha256 }}
+      tar_size: ${{ steps.hash.outputs.tar_size }}
+
+    steps:
+      - name: Check out Scout-Desktop
+        uses: actions/checkout@v4
+        with:
+          repository: Orage-Agency/Scout-Desktop
+          ref: ${{ needs.prepare.outputs.sha }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+
+      - name: Record the source commit
+        run: |
+          echo "SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "Building Scout-Desktop@$(git rev-parse --short HEAD) (${{ inputs.ref }}) as ${{ inputs.tag }}"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Derive the app version from the tag
+        id: version
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          echo "build_name=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "build_number=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      # flutter build linux needs the GTK/WebKit dev headers; ubuntu-latest
+      # ships most of them but ninja and the full set are pinned here so the
+      # runner image drifting cannot break the build silently.
+      - name: Install Linux build prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build libgtk-3-dev libwebkit2gtk-4.1-dev libblkid-dev \
+            liblzma-dev libsecret-1-dev libgirepository1.0-dev pkg-config
+
+      - name: Build desktop app
+        run: >-
+          flutter build linux --release --no-tree-shake-icons
+          --build-name "${{ steps.version.outputs.build_name }}"
+          --build-number "${{ steps.version.outputs.build_number }}"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: engine/package-lock.json
+
+      - name: Install engine dependencies
+        working-directory: engine
+        run: npm ci
+
+      - name: Fetch whisper.cpp for narration (best effort)
+        working-directory: engine
+        continue-on-error: true
+        run: node scripts/download-whisper.js
+
+      - name: Generate engine icon
+        working-directory: engine
+        run: npm run gen-icon
+
+      # Same --dir pattern as the Windows job: the unpacked engine rides
+      # inside the shell bundle, never on its own.
+      - name: Build engine (Linux)
+        working-directory: engine
+        run: |
+          set -euo pipefail
+          npx electron-builder --linux --x64 --dir --publish never
+          test -d dist/linux-unpacked
+
+      - name: Merge the engine into the Flutter bundle
+        run: |
+          set -euo pipefail
+          BUNDLE="build/linux/x64/release/bundle"
+          test -x "$BUNDLE/scout_desktop"
+          mkdir -p "$BUNDLE/engine"
+          cp -a engine/dist/linux-unpacked/. "$BUNDLE/engine/"
+          BIN="$(find "$BUNDLE/engine" -maxdepth 1 -type f -executable ! -name 'scout-mcp-server*' | head -n 1)"
+          test -n "$BIN"
+          # The supervisor looks for engine/scout-engine (then scout, Scout).
+          ln -sf "$(basename "$BIN")" "$BUNDLE/engine/scout-engine"
+          ls -la "$BUNDLE/engine" | head -n 12
+
+      - name: Package the Linux tarball
+        run: |
+          set -euo pipefail
+          cd build/linux/x64/release
+          cp -a bundle scout-linux-x64
+          tar czf "$GITHUB_WORKSPACE/scout-linux-x64.tar.gz" scout-linux-x64
+          cd "$GITHUB_WORKSPACE"
+          ls -la scout-linux-x64.tar.gz
+
+      - name: Publish the Linux app to this download page
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          gh release upload "$TAG" scout-linux-x64.tar.gz --repo "$GITHUB_REPOSITORY" --clobber
+          BASE="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          echo "Tarball: $BASE/scout-linux-x64.tar.gz"
+
+      # Linux has no auto-update client, so the checksum is recorded for the
+      # summary/release record only.
+      - name: Record the Linux checksum
+        id: hash
+        run: |
+          set -euo pipefail
+          echo "tar_sha256=$(sha256sum scout-linux-x64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "tar_size=$(stat -c%s scout-linux-x64.tar.gz)" >> "$GITHUB_OUTPUT"
 
   # What actually landed on the page, in one place.
   summary:
