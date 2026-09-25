@@ -58,6 +58,7 @@ jobs:
         if: steps.gate.outputs.deploy == 'true'
         with:
           repository: Orage-Agency/Scout-Desktop
+          token: ${{ secrets.SCOUT_DESKTOP_TOKEN }}
 
       - uses: subosito/flutter-action@v2
         if: steps.gate.outputs.deploy == 'true'
