@@ -35,6 +35,8 @@ on:
           - 'mac and windows'
           - 'mac only'
           - 'windows only'
+          - 'mac and linux'
+          - 'windows and linux'
           - 'mac, windows and linux'
           - 'linux only'
       replace_existing:
@@ -107,14 +109,14 @@ jobs:
           # completed later (e.g. "windows only" onto a mac-only release)
           # without ever overwriting a file that is already there.
           WANTED=""
-          if [ "${{ inputs.platforms }}" != "windows only" ] && [ "${{ inputs.platforms }}" != "linux only" ]; then
+          if [ "${{ inputs.platforms }}" != "windows only" ] && [ "${{ inputs.platforms }}" != "linux only" ] && [ "${{ inputs.platforms }}" != "windows and linux" ]; then
             WANTED="scout-macos.dmg scout-macos.zip"
           fi
-          if [ "${{ inputs.platforms }}" != "mac only" ] && [ "${{ inputs.platforms }}" != "linux only" ]; then
+          if [ "${{ inputs.platforms }}" != "mac only" ] && [ "${{ inputs.platforms }}" != "linux only" ] && [ "${{ inputs.platforms }}" != "mac and linux" ]; then
             WANTED="$WANTED scout-windows-setup.exe scout-windows-x64.zip"
           fi
           case "${{ inputs.platforms }}" in
-            'linux only'|'mac, windows and linux')
+            'linux only'|'mac and linux'|'windows and linux'|'mac, windows and linux')
               WANTED="$WANTED scout-linux-x64.tar.gz";;
           esac
           # replace_existing is the deliberate escape hatch: it is how a file
@@ -145,7 +147,7 @@ jobs:
           EOF
           )"
           case "${{ inputs.platforms }}" in
-            'linux only'|'mac, windows and linux')
+            'linux only'|'mac and linux'|'windows and linux'|'mac, windows and linux')
               LINUX_NOTE="$(cat <<'LNOTE'
 
           **Linux (64-bit)** — download `scout-linux-x64.tar.gz`, untar it (`tar xzf scout-linux-x64.tar.gz`) and run `scout-linux-x64/scout_desktop`. Scout is not offered as an automatic update on Linux; install it once by hand and re-download new versions from this page. For a per-user install with a launcher entry, use `scripts/install-linux.sh` from a local checkout instead.
@@ -169,7 +171,7 @@ jobs:
   build-macos:
     name: Build macOS
     needs: prepare
-    if: inputs.platforms != 'windows only' && inputs.platforms != 'linux only'
+    if: inputs.platforms != 'windows only' && inputs.platforms != 'linux only' && inputs.platforms != 'windows and linux'
     runs-on: macos-latest
     # macOS waits on Apple's notarization service (up to three submissions).
     timeout-minutes: 180
@@ -593,7 +595,7 @@ jobs:
   build-windows:
     name: Build Windows
     needs: prepare
-    if: inputs.platforms != 'mac only' && inputs.platforms != 'linux only'
+    if: inputs.platforms != 'mac only' && inputs.platforms != 'linux only' && inputs.platforms != 'mac and linux'
     runs-on: windows-latest
     timeout-minutes: 120
 
@@ -935,7 +937,7 @@ jobs:
   build-linux:
     name: Build Linux
     needs: prepare
-    if: inputs.platforms == 'linux only' || inputs.platforms == 'mac, windows and linux'
+    if: inputs.platforms == 'linux only' || inputs.platforms == 'mac and linux' || inputs.platforms == 'windows and linux' || inputs.platforms == 'mac, windows and linux'
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -1065,7 +1067,7 @@ jobs:
   # What actually landed on the page, in one place.
   summary:
     name: What landed on the page
-    needs: [prepare, build-macos, build-windows]
+    needs: [prepare, build-macos, build-windows, build-linux]
     if: always() && needs.prepare.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -1089,12 +1091,14 @@ jobs:
             | tee -a "$GITHUB_STEP_SUMMARY"
           # A build that failed leaves its file missing; say so plainly.
           ASSETS="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '[.assets[].name] | join(" ")')"
-          MAC_WANTED="${{ inputs.platforms != 'windows only' }}"
-          WIN_WANTED="${{ inputs.platforms != 'mac only' }}"
+          MAC_WANTED="${{ inputs.platforms != 'windows only' && inputs.platforms != 'linux only' && inputs.platforms != 'windows and linux' }}"
+          WIN_WANTED="${{ inputs.platforms != 'mac only' && inputs.platforms != 'linux only' && inputs.platforms != 'mac and linux' }}"
+          LINUX_WANTED="${{ inputs.platforms == 'linux only' || inputs.platforms == 'mac and linux' || inputs.platforms == 'windows and linux' || inputs.platforms == 'mac, windows and linux' }}"
           FAILED=0
           case "$MAC_WANTED:$ASSETS" in true:*scout-macos.dmg*) ;; true:*) echo "::error::scout-macos.dmg is missing"; FAILED=1;; esac
           case "$WIN_WANTED:$ASSETS" in true:*scout-windows-x64.zip*) ;; true:*) echo "::error::scout-windows-x64.zip is missing"; FAILED=1;; esac
           case "$WIN_WANTED:$ASSETS" in true:*scout-windows-setup.exe*) ;; true:*) echo "::error::scout-windows-setup.exe is missing"; FAILED=1;; esac
+          case "$LINUX_WANTED:$ASSETS" in true:*scout-linux-x64.tar.gz*) ;; true:*) echo "::error::scout-linux-x64.tar.gz is missing"; FAILED=1;; esac
           exit $FAILED
 
   # Records what this build produced and puts it on the BETA channel, which
@@ -1106,13 +1110,13 @@ jobs:
   # cannot move `releases/latest` off v3.6.0 and break the Scout 1 fleet.
   manifest:
     name: Record the build and update the beta channel
-    needs: [prepare, build-macos, build-windows, summary]
+    needs: [prepare, build-macos, build-windows, build-linux, summary]
     # `summary` already fails the run when a platform this run asked for is
     # missing its files, so reusing its verdict IS the half-manifest guard: a
     # failed platform turns summary red and this job is skipped, so nothing is
     # published. `always()` is needed because a skipped build job would
     # otherwise skip this one too.
-    if: always() && needs.summary.result == 'success'
+    if: always() && needs.summary.result == 'success' && inputs.platforms != 'linux only'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
