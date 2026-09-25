@@ -1,0 +1,92 @@
+name: Scout site auto-update
+
+# Keeps https://scout-web-omega.vercel.app in sync with the latest tag in
+# Orage-Agency/Scout-Releases. Polls the tag list, compares it to the version
+# live on the site (version.json), and rebuilds + redeploys the Flutter web
+# build when they differ.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scout-site-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve latest Scout-Releases tag
+        id: latest
+        run: |
+          TAG=$(gh api repos/Orage-Agency/Scout-Releases/tags --jq '.[0].name' 2>/dev/null || true)
+          if [ -z "$TAG" ]; then
+            TAG=$(gh api repos/Orage-Agency/Scout-Releases/releases/latest --jq '.tag_name')
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Latest Scout-Releases tag: $TAG"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read version currently live on the site
+        id: live
+        run: |
+          LIVE=$(curl -fsSL https://scout-web-omega.vercel.app/version.json | jq -r .version || echo unknown)
+          echo "version=$LIVE" >> "$GITHUB_OUTPUT"
+          echo "Live site version: $LIVE"
+
+      - name: Skip if already up to date
+        id: gate
+        run: |
+          WANT="${{ steps.latest.outputs.tag }}"
+          WANT="${WANT#v}"
+          LIVE="${{ steps.live.outputs.version }}"
+          if [ "$WANT" = "$LIVE" ]; then
+            echo "Site already at $LIVE — nothing to do."
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Deploy needed: $LIVE -> $WANT"
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.deploy == 'true'
+
+      - uses: subosito/flutter-action@v2
+        if: steps.gate.outputs.deploy == 'true'
+        with:
+          channel: stable
+          cache: true
+
+      - name: Build Flutter web (release)
+        if: steps.gate.outputs.deploy == 'true'
+        run: flutter build web --release
+
+      - name: Deploy to Vercel (scout-web, production)
+        if: steps.gate.outputs.deploy == 'true'
+        working-directory: build/web
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          mkdir -p .vercel
+          cat > .vercel/project.json <<JSON
+          {"orgId":"$VERCEL_ORG_ID","projectId":"$VERCEL_PROJECT_ID"}
+          JSON
+          npx --yes vercel@latest deploy --prebuilt --prod --yes --token "$VERCEL_TOKEN" 2>&1 | tee deploy.log
+
+      - name: Verify live version
+        if: steps.gate.outputs.deploy == 'true'
+        run: |
+          sleep 15
+          LIVE=$(curl -fsSL https://scout-web-omega.vercel.app/version.json | jq -r .version)
+          WANT="${{ steps.latest.outputs.tag }}"
+          WANT="${WANT#v}"
+          echo "Live now: $LIVE (expected $WANT)"
+          [ "$LIVE" = "$WANT" ] || { echo "Version mismatch after deploy"; exit 1; }
