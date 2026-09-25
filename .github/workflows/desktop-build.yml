@@ -264,6 +264,7 @@ jobs:
           APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
         run: |
           set -euo pipefail
+          EXPECTED_TEAM_ID='HU749X2FPS'
           if [ -z "${MAC_CERT_P12_BASE64:-}" ] || [ -z "${APPLE_API_KEY_P8:-}" ]; then
             echo "::error::Apple signing secrets missing: refusing to build an unsigned Mac app"
             exit 1
@@ -279,7 +280,14 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCPW" "$KC" > /dev/null
           security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
           IDENTITY="$(security find-identity -v -p codesigning "$KC" | grep -o '"Developer ID Application: [^"]*"' | head -n 1 | tr -d '"')"
-          test -n "$IDENTITY"
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::No Developer ID Application identity was imported."
+            exit 1
+          fi
+          case "$IDENTITY" in
+            *" ($EXPECTED_TEAM_ID)") ;;
+            *) echo "::error::Developer ID identity must belong to team $EXPECTED_TEAM_ID."; exit 1 ;;
+          esac
           echo "Signing identity: $IDENTITY"
           printf '%s' "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/asc-key.p8"
           rm -f "$RUNNER_TEMP/devid.p12"
@@ -287,6 +295,7 @@ jobs:
             echo "SIGNED=1"
             echo "SIGN_IDENTITY=$IDENTITY"
             echo "SIGN_KEYCHAIN=$KC"
+            echo "SIGN_TEAM_ID=$EXPECTED_TEAM_ID"
             echo "ASC_KEY_FILE=$RUNNER_TEMP/asc-key.p8"
           } >> "$GITHUB_ENV"
 
@@ -361,17 +370,120 @@ jobs:
 
           sign_app() {
             local app="$1"
+            local bundle_id
+            bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")"
+            if [ "$bundle_id" != "agency.orage.scout.shell" ]; then
+              echo "::error::Unexpected Scout bundle identifier: $bundle_id"
+              exit 1
+            fi
+
             # Nested code first: every framework and dylib the Flutter shell
             # ships. The engine app is already Developer ID signed by
             # electron-builder with its own entitlements and is left as is.
+            # Sparkle is signed component by component below: signing only its
+            # framework wrapper leaves Updater/Autoupdate/XPC code with the
+            # upstream signature and causes Apple's notarization rejection.
             while IFS= read -r -d '' item; do
+              case "$item" in
+                */Sparkle.framework) continue ;;
+              esac
               codesign --force --options runtime --timestamp --keychain "$SIGN_KEYCHAIN" --sign "$SIGN_IDENTITY" "$item"
             done < <(find "$app/Contents/Frameworks" -depth \( -name '*.framework' -o -name '*.dylib' \) -print0 2>/dev/null)
+
+            sign_sparkle_helpers "$app"
             codesign --verify --deep --strict --verbose=2 "$app/Contents/Resources/engine/Scout Engine.app"
             codesign --force --options runtime --timestamp --keychain "$SIGN_KEYCHAIN" \
               --entitlements macos/Runner/Release.entitlements --sign "$SIGN_IDENTITY" "$app"
             codesign --verify --deep --strict --verbose=2 "$app"
-            codesign --display --verbose=2 "$app" 2>&1 | grep -E "Authority|flags|TeamIdentifier" || true
+            verify_developer_id_signature "$app"
+          }
+
+          verify_developer_id_signature() {
+            local target="$1" details
+            codesign --verify --strict --verbose=2 "$target"
+            details="$(codesign --display --verbose=4 "$target" 2>&1)"
+            printf '%s\n' "$details" | grep -Fq "TeamIdentifier=$SIGN_TEAM_ID" || {
+              echo "::error::$(basename "$target") is not signed by Developer ID team $SIGN_TEAM_ID"
+              printf '%s\n' "$details"
+              exit 1
+            }
+            printf '%s\n' "$details" | grep -Fq 'Authority=Developer ID Application:' || {
+              echo "::error::$(basename "$target") has no Developer ID Application authority"
+              printf '%s\n' "$details"
+              exit 1
+            }
+            printf '%s\n' "$details" | grep -Eq '^Timestamp=' || {
+              echo "::error::$(basename "$target") has no secure signature timestamp"
+              printf '%s\n' "$details"
+              exit 1
+            }
+          }
+
+          sign_sparkle_helpers() {
+            local app="$1"
+            local sparkle="$app/Contents/Frameworks/Sparkle.framework"
+            local version services updater downloader installer autoupdate executable component executable_name
+
+            if [ ! -d "$sparkle" ]; then
+              echo "::error::Sparkle.framework not found at $sparkle"
+              exit 1
+            fi
+            version="$(cd "$sparkle/Versions/Current" && pwd -P)"
+            services="$version/XPCServices"
+            updater="$version/Updater.app"
+            autoupdate="$version/Autoupdate"
+            downloader="$services/Downloader.xpc"
+            installer="$services/Installer.xpc"
+            for component in "$autoupdate" "$updater" "$downloader" "$installer"; do
+              if [ ! -e "$component" ]; then
+                echo "::error::Expected Sparkle component not found: $component"
+                exit 1
+              fi
+            done
+
+            # XPC bundles carry their own hardened-runtime signatures. Keep
+            # Sparkle's sandbox entitlements on Downloader when re-signing it.
+            for component in "$installer" "$downloader"; do
+              executable_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$component/Contents/Info.plist")"
+              executable="$component/Contents/MacOS/$executable_name"
+              if [ ! -f "$executable" ]; then
+                echo "::error::Sparkle XPC executable not found: $executable"
+                exit 1
+              fi
+              echo "Signing Sparkle XPC helper: $component"
+              if [ "$component" = "$downloader" ]; then
+                codesign --force --options runtime --timestamp --keychain "$SIGN_KEYCHAIN" \
+                  --preserve-metadata=entitlements --sign "$SIGN_IDENTITY" "$component"
+              else
+                codesign --force --options runtime --timestamp --keychain "$SIGN_KEYCHAIN" \
+                  --sign "$SIGN_IDENTITY" "$component"
+              fi
+              verify_developer_id_signature "$executable"
+              verify_developer_id_signature "$component"
+            done
+
+            echo "Signing Sparkle helper: $autoupdate"
+            codesign --force --options runtime --timestamp --keychain "$SIGN_KEYCHAIN" \
+              --sign "$SIGN_IDENTITY" "$autoupdate"
+            verify_developer_id_signature "$autoupdate"
+
+            executable_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$updater/Contents/Info.plist")"
+            executable="$updater/Contents/MacOS/$executable_name"
+            if [ ! -f "$executable" ]; then
+              echo "::error::Sparkle Updater executable not found: $executable"
+              exit 1
+            fi
+            echo "Signing Sparkle helper: $updater"
+            codesign --force --options runtime --timestamp --keychain "$SIGN_KEYCHAIN" \
+              --sign "$SIGN_IDENTITY" "$updater"
+            verify_developer_id_signature "$executable"
+            verify_developer_id_signature "$updater"
+
+            # Seal the framework only after each nested helper is signed.
+            echo "Signing Sparkle framework: $sparkle"
+            codesign --force --options runtime --timestamp --keychain "$SIGN_KEYCHAIN" \
+              --sign "$SIGN_IDENTITY" "$sparkle"
+            verify_developer_id_signature "$sparkle"
           }
 
           # lib/services/teach/whisper_service.dart looks for whisper-cli at
