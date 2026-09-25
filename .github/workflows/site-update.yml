@@ -56,6 +56,8 @@ jobs:
 
       - uses: actions/checkout@v4
         if: steps.gate.outputs.deploy == 'true'
+        with:
+          repository: Orage-Agency/Scout-Desktop
 
       - uses: subosito/flutter-action@v2
         if: steps.gate.outputs.deploy == 'true'
